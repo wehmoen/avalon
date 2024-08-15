@@ -1,26 +1,29 @@
-var GrowInt = require('./growInt.js')
-var eco = require('./economics.js')
+const GrowInt = require('growint')
+const CryptoJS = require('crypto-js')
+const { EventEmitter } = require('events')
+const cloneDeep = require('clone-deep')
+const bson = require('bson')
+const Transaction = require('./transactions')
+const TransactionType = Transaction.Types
+const max_mempool = process.env.MEMPOOL_SIZE || 2000
 
-var TransactionType = {
-    NEW_ACCOUNT: 0,
-    APPROVE_NODE_OWNER: 1,
-    DISAPROVE_NODE_OWNER: 2,
-    TRANSFER: 3,
-    COMMENT: 4,
-    VOTE: 5,
-    USER_JSON: 6,
-    FOLLOW: 7,
-    UNFOLLOW: 8,
-    RESHARE: 9, // not sure
-};
+// probably due to non standard utf8 characters that were not properly written to mongodb/bson file
+// for now we skip them until such bug can be reproduced
+const skiphash = {
+    '7dedc07cb42c96b5013710161bf487a2488fce789b80286e3df910075f98a4d1': '16de2c5c847962f3683aec852072e702fb8c4ffd81c3d23cf85b8d2da031bd8e' // tx in block 14,874,851
+}
 
-transaction = {
+let transaction = {
     pool: [], // the pool holds temporary txs that havent been published on chain yet
+    eventConfirmation: new EventEmitter(),
     addToPool: (txs) => {
+        if (transaction.isPoolFull())
+            return
+
         for (let y = 0; y < txs.length; y++) {
-            var exists = false;
+            let exists = false
             for (let i = 0; i < transaction.pool.length; i++)
-                if (transaction.pool[i].hash == txs[y].hash)
+                if (transaction.pool[i].hash === txs[y].hash)
                     exists = true
             
             if (!exists)
@@ -28,19 +31,32 @@ transaction = {
         }
         
     },
+    isPoolFull: () => {
+        if (transaction.pool.length >= max_mempool) {
+            logr.warn('Mempool is full ('+transaction.pool.length+'/'+max_mempool+' txs), ignoring tx')
+            return true
+        }
+        return false
+    },
     removeFromPool: (txs) => {
         for (let y = 0; y < txs.length; y++)
             for (let i = 0; i < transaction.pool.length; i++)
-                if (transaction.pool[i].hash == txs[y].hash) {
+                if (transaction.pool[i].hash === txs[y].hash) {
                     transaction.pool.splice(i, 1)
                     break
                 }
-                    
+    },
+    cleanPool: () => {
+        for (let i = 0; i < transaction.pool.length; i++)
+            if (transaction.pool[i].ts + config.txExpirationTime < new Date().getTime()) {
+                transaction.pool.splice(i,1)
+                i--
+            }
     },
     isInPool: (tx) => {
-        var isInPool = false
+        let isInPool = false
         for (let i = 0; i < transaction.pool.length; i++)
-            if (transaction.pool[i].hash == tx.hash) {
+            if (transaction.pool[i].hash === tx.hash) {
                 isInPool = true
                 break
             }
@@ -48,628 +64,265 @@ transaction = {
     },
     isPublished: (tx) => {
         if (!tx.hash) return
-        for (let i = 0; i < chain.recentBlocks.length; i++) {
-            const txs = chain.recentBlocks[i].txs
-            for (let y = 0; y < txs.length; y++) {
-                if (txs[y].hash == tx.hash)
-                    return true
-            }
-        }
+        if (chain.recentTxs[tx.hash])
+            return true
         return false
     },
     isValid: (tx, ts, cb) => {
         if (!tx) {
-            logr.debug('no transaction')
-            cb(false); return
+            cb(false, 'no transaction'); return
         }
         // checking required variables one by one
-        if (typeof tx.type !== "number" || tx.type < 0 || tx.type > Number.MAX_SAFE_INTEGER) {
-            logr.debug('invalid tx type')
-            cb(false); return
+        
+        if (!validate.integer(tx.type, true, false)) {
+            cb(false, 'invalid tx type'); return
         }
-        if (!tx.data || typeof tx.data !== "object") {
-            logr.debug('invalid tx data')
-            cb(false); return
+        if (!tx.data || typeof tx.data !== 'object') {
+            cb(false, 'invalid tx data'); return
         }
-        if (!tx.sender || typeof tx.sender !== "string") {
-            logr.debug('invalid tx sender')
-            cb(false); return
+        if (!validate.string(tx.sender, config.accountMaxLength, config.accountMinLength, config.allowedUsernameChars, config.allowedUsernameCharsOnlyMiddle)) {
+            cb(false, 'invalid tx sender'); return
         }
-        if (!tx.ts || typeof tx.ts !== "number" || tx.ts < 0 || tx.ts > Number.MAX_SAFE_INTEGER) {
-            logr.debug('invalid tx ts')
-            cb(false); return
+        if (!validate.integer(tx.ts, false, false)) {
+            cb(false, 'invalid tx ts'); return
         }
-        if (!tx.hash || typeof tx.hash !== "string") {
-            logr.debug('invalid tx hash')
-            cb(false); return
+        if (!tx.hash || typeof tx.hash !== 'string') {
+            cb(false, 'invalid tx hash'); return
         }
-        if (!tx.signature || typeof tx.signature !== "string") {
-            logr.debug('invalid tx signature')
-            cb(false); return
+        if (!tx.signature || (typeof tx.signature !== 'string' && !(config.multisig && Array.isArray(tx.signature)))) {
+            cb(false, 'invalid tx signature'); return
         }
+        // multisig transactions check
+        // signatures in multisig txs contain an array of signatures and recid 
+        if (config.multisig && Array.isArray(tx.signature))
+            for (let s = 0; s < tx.signature.length; s++)
+                if (!Array.isArray(tx.signature[s]) || tx.signature[s].length !== 2 || typeof tx.signature[s][0] !== 'string' || !Number.isInteger(tx.signature[s][1]))
+                    return cb(false, 'invalid multisig tx signature #'+s)
 
+        // enforce transaction limits
+        if (config.txLimits[tx.type] && config.txLimits[tx.type] === 1) {
+            cb(false, 'transaction type is disabled'); return
+        }
+        if (config.txLimits[tx.type] && config.txLimits[tx.type] === 2
+            && tx.sender !== config.masterName) {
+            cb(false, 'only "'+config.masterName+'" can execute this transaction type'); return
+        }
+        if (config.masterDao && tx.sender === config.masterName && !config.masterDaoTxs.includes(tx.type))
+            return cb(false, 'master dao account cannot transact with type '+tx.type)
         // avoid transaction reuse
         // check if we are within 1 minute of timestamp seed
-        if (chain.getLatestBlock().timestamp - tx.ts > 60000) {
-            logr.debug('invalid timestamp')
-            cb(false); return
+        if (chain.getLatestBlock().timestamp - tx.ts > config.txExpirationTime) {
+            cb(false, 'invalid timestamp'); return
         }
+        // enforce maximum transaction expiration
+        if (tx.ts - ts > config.txExpirationMax)
+            return cb(false, 'timestamp expiration exceeds max limit of '+config.txExpirationMax+'ms')
         // check if this tx hash was already added to chain recently
         if (transaction.isPublished(tx)) {
-            logr.debug('transaction already in chain')
-            cb(false); return
+            cb(false, 'transaction already in chain'); return
         }
-
+        // verify hash matches the transaction's payload
+        let newTx = cloneDeep(tx)
+        delete newTx.signature
+        delete newTx.hash
+        let computedHash = CryptoJS.SHA256(JSON.stringify(newTx)).toString()
+        if (computedHash !== tx.hash && (skiphash[tx.hash] !== computedHash || (!p2p.recovering && chain.getLatestBlock()._id > chain.restoredBlocks))) {
+            cb(false, 'invalid tx hash does not match'); return
+        }
+        // ensure nothing gets lost when serialized in bson
+        // skipped during replays or rebuilds
+        if (!p2p.recovering && chain.getLatestBlock()._id > chain.restoredBlocks && Transaction.transactions[tx.type].bsonValidate) {
+            let bsonified = bson.deserialize(bson.serialize(newTx))
+            let bsonifiedHash = CryptoJS.SHA256(JSON.stringify(bsonified)).toString()
+            if (computedHash !== bsonifiedHash)
+                return cb(false, 'unserializable transaction, perhaps due to non-utf8 character?')
+        }
         // checking transaction signature
-        chain.isValidSignature(tx.sender, tx.hash, tx.signature, function(legitUser) {
+        chain.isValidSignature(tx.sender, tx.type, tx.hash, tx.signature, function(legitUser,e) {
             if (!legitUser) {
-                logr.debug('invalid signature')
-                cb(false); return
+                cb(false, e || 'invalid signature'); return
+            }
+            if (!legitUser.bw) {
+                cb(false, 'user has no bandwidth object'); return
+            }
+
+            let newBw = new GrowInt(legitUser.bw, {
+                growth: Math.max(legitUser.baseBwGrowth || 0, legitUser.balance)/(config.bwGrowth),
+                max: config.bwMax
+            }).grow(ts)
+
+            if (!newBw) {
+                logr.debug(legitUser)
+                cb(false, 'error debug'); return
             }
 
             // checking if the user has enough bandwidth
-            if (JSON.stringify(tx).length > new GrowInt(legitUser.bw, {growth:legitUser.balance/(60000), max:1048576}).grow(ts).v) {
-                logr.debug('not enough bandwidth')
-                cb(false); return
+            if (JSON.stringify(tx).length > newBw.v && tx.sender !== config.masterName) {
+                cb(false, 'need more bandwidth ('+(JSON.stringify(tx).length-newBw.v)+' B)'); return
             }
 
             // check transaction specifics
-            switch (tx.type) {
-                case TransactionType.NEW_ACCOUNT:
-                    if (!tx.data.name || typeof tx.data.name !== "string" || tx.data.name.length > 50) {
-                        logr.debug('invalid tx data.name')
-                        cb(false); return
-                    }
-                    if (!tx.data.pub || typeof tx.data.pub !== "string" || tx.data.pub.length > 50) {
-                        logr.debug('invalid tx data.pub')
-                        cb(false); return
-                    }
+            transaction.isValidTxData(tx, ts, legitUser, function(isValid, error) {
+                cb(isValid, error)
+            })
+        })
+    },
+    isValidTxData: (tx, ts, legitUser, cb) => {
+        Transaction.validate(tx, ts, legitUser, function(err, res) {
+            cb(err, res)
+        })
+    },
+    notEnoughVP: (amount, ts, legitUser) => {
+        // checking if user has enough power for a transaction requiring voting power
+        let vtGrowConfig = {
+            growth: legitUser.balance / config.vtGrowth,
+            max: legitUser.maxVt
+        }
+        let vtBefore = new GrowInt(legitUser.vt, vtGrowConfig).grow(ts)
+        return {
+            has: vtBefore.v,
+            needs: Math.max(Math.abs(amount) - vtBefore.v,0)
+        }
+    },
+    collectGrowInts: (tx, ts, cb) => {
+        cache.findOne('accounts', {name: tx.sender}, function(err, account) {
+            // collect bandwidth
+            let bandwidth = new GrowInt(account.bw, {
+                growth: Math.max(account.baseBwGrowth || 0, account.balance)/(config.bwGrowth),
+                max: config.bwMax
+            })
+            let needed_bytes = JSON.stringify(tx).length
+            let bw = bandwidth.grow(ts)
+            if (!bw) 
+                throw 'No bandwidth error'
+            
+            bw.v -= needed_bytes
+            if (tx.type === TransactionType.TRANSFER_BW)
+                bw.v -= tx.data.amount
+            else if (tx.type === TransactionType.NEW_ACCOUNT_WITH_BW)
+                bw.v -= tx.data.bw
 
-                    var lowerUser = tx.data.name.toLowerCase()
-
-                    for (let i = 0; i < lowerUser.length; i++) {
-                        const c = lowerUser[i];
-                        // allowed username chars
-                        if ('abcdefghijklmnopqrstuvwxyz0123456789'.indexOf(c) == -1) {
-                            logr.debug('invalid tx data.name char')
-                            cb(false); return
-                        }
-                    }
-
-                    db.collection('accounts').findOne({name: lowerUser}, function(err, account) {
-                        if (err) throw err;
-                        if (account)
-                            cb(false)
-                        else if (tx.data.name !== tx.data.pub || tx.data.name.length < 25) {
-                            // if it's not a free account, check tx sender balance
-                            db.collection('accounts').findOne({name: tx.sender}, function(err, account) {
-                                if (err) throw err;
-                                if (account.balance < 60)
-                                    cb(false)
-                                else
-                                    cb(true)
-                            })
-                        } else cb(true)
-                    })
-                    break;
-                
-
-                case TransactionType.APPROVE_NODE_OWNER:
-                    if (!tx.data.target || typeof tx.data.target !== "string" || tx.data.target.length > 25) {
-                        logr.debug('invalid tx data.target')
-                        cb(false); return
-                    }
-
-                    db.collection('accounts').findOne({name: tx.sender}, function(err, acc) {
-                        if (err) throw err;
-                        if (!acc.approves) acc.approves = []
-                        if (acc.approves.indexOf(tx.data.target) > -1) {
-                            cb(false); return
-                        }
-                        if (acc.approves.length >= 5)
-                            cb(false)
-                        else {
-                            db.collection('accounts').findOne({name: tx.data.target}, function(err, account) {
-                                if (!account) {
-                                    cb(false)
-                                } else {
-                                    cb(true)
-                                }
-                            })
-                        }
-                    })
-                    break;
-
-                case TransactionType.DISAPROVE_NODE_OWNER:
-                    if (!tx.data.target || typeof tx.data.target !== "string" || tx.data.target.length > 25) {
-                        logr.debug('invalid tx data.target')
-                        cb(false); return
-                    }
-
-                    db.collection('accounts').findOne({name: tx.sender}, function(err, acc) {
-                        if (err) throw err;
-                        if (!acc.approves) acc.approves = []
-                        if (acc.approves.indexOf(tx.data.target) == -1) {
-                            cb(false); return
-                        }
-                        db.collection('accounts').findOne({name: tx.data.target}, function(err, account) {
-                            if (!account) {
-                                cb(false)
-                            } else {
-                                cb(true)
-                            }
-                        })
-                    })
-                    break;
-
-                case TransactionType.TRANSFER:
-                    if (!tx.data.receiver || typeof tx.data.receiver !== "string" || tx.data.receiver.length > 25) {
-                        logr.debug('invalid tx data.receiver')
-                        cb(false); return
-                    }
-                    if (!tx.data.amount || typeof tx.data.amount !== "number" || tx.data.amount < 1 || tx.data.amount > Number.MAX_SAFE_INTEGER) {
-                        logr.debug('invalid tx data.amount')
-                        cb(false); return
-                    }
-                    if (tx.data.amount != Math.floor(tx.data.amount)) {
-                        logr.debug('invalid tx data.amount not an integer')
-                        cb(false); return
-                    }
-                    
-                    db.collection('accounts').findOne({name: tx.sender}, function(err, account) {
-                        if (err) throw err;
-                        if (account.balance < tx.data.amount)
-                            cb(false)
-                        else {
-                            db.collection('accounts').findOne({name: tx.data.receiver}, function(err, account) {
-                                if (err) throw err;
-                                if (!account) cb(false)
-                                else cb(true)
-                            })
-                        }
-                    })
-                    break;
-
-                case TransactionType.COMMENT:
-                    // permlink
-                    if (!tx.data.link || typeof tx.data.link !== "string" || tx.data.link.length > 25) {
-                        logr.debug('invalid tx data.link')
-                        cb(false); return
-                    }
-                    // parent author
-                    if ((tx.data.pa && tx.data.pp) && (typeof tx.data.pa !== "string" || tx.data.pa.length > 25)) {
-                        logr.debug('invalid tx data.pa')
-                        cb(false); return
-                    }
-                    // parent permlink
-                    if ((tx.data.pa && tx.data.pp) && (typeof tx.data.pp !== "string" || tx.data.pp.length > 25)) {
-                        logr.debug('invalid tx data.pp')
-                        cb(false); return
-                    }
-                    // handle arbitrary json input
-                    if (!tx.data.json || typeof tx.data.json !== "object" || JSON.stringify(tx.data.json).length > 250000) {
-                        logr.debug('invalid tx data.json')
-                        cb(false); return
-                    }
-                    // commenting costs 1 vote token as a forced self-upvote
-                    var vt = new GrowInt(legitUser.vt, {growth:legitUser.balance/(3600000)}).grow(ts)
-                    if (vt.v < 1) {
-                        logr.debug('not enough vt for comment')
-                        cb(false); return
-                    }
-
-                    if (tx.data.pa && tx.data.pp) {
-                        // its a comment of another comment
-                        db.collection('contents').findOne({author: tx.data.pa, link: tx.data.pp}, function(err, content) {
-                            if (!content) {
-                                logr.debug('new comment tried to reference a non existing comment')
-                                cb(false); return
-                            }
-                            db.collection('contents').findOne({author: tx.sender, link: tx.data.link}, function(err, content) {
-                                if (content) {
-                                    // user is editing an existing comment
-                                    if (content.pa != tx.data.pa || content.pp != tx.data.pp) {
-                                        logr.debug('users tried to change the pa and/or pp of a comment')
-                                        cb(false); return
-                                    }
-                                } else {
-                                    // it is a new comment
-                                    cb(true)
-                                }
-                            })
-                        })
-                    } else {
-                        cb(true)
-                    }
-
-                    break;
-
-                case TransactionType.VOTE:
-                    if (!tx.data.author || typeof tx.data.author !== "string" || tx.data.author.length > 25) {
-                        logr.debug('invalid tx data.author')
-                        cb(false); return
-                    }
-                    if (!tx.data.link || typeof tx.data.link !== "string" || tx.data.link.length > 25) {
-                        logr.debug('invalid tx data.link')
-                        cb(false); return
-                    }
-                    if (!tx.data.vt || typeof tx.data.vt !== "number" || tx.data.vt < Number.MIN_SAFE_INTEGER || tx.data.vt > Number.MAX_SAFE_INTEGER) {
-                        logr.debug('invalid tx data.vt')
-                        cb(false); return
-                    }
-                    var vt = new GrowInt(legitUser.vt, {growth:legitUser.balance/(3600000)}).grow(ts)
-                    if (vt.v < Math.abs(tx.data.vt)) {
-                        logr.debug('invalid tx not enough vt')
-                        cb(false); return
-                    }
-                    cb(true)
-                    break;
-
-                case TransactionType.USER_JSON:
-                    // handle arbitrary json input
-                    if (!tx.data.json || typeof tx.data.json !== "object" || JSON.stringify(tx.data.json).length > 250000) {
-                        logr.debug('invalid tx data.json')
-                        cb(false); return
-                    }
-                    cb(true)
-                    break;
-
-                case TransactionType.FOLLOW:
-                    if (!tx.data.target || typeof tx.data.target !== "string" || tx.data.target.length > 25) {
-                        logr.debug('invalid tx data.target')
-                        cb(false); return
-                    }
-
-                    db.collection('accounts').findOne({name: tx.sender}, function(err, acc) {
-                        if (err) throw err;
-                        if (!acc.follows) acc.follows = []
-                        if (acc.follows.indexOf(tx.data.target) > -1) {
-                            cb(false); return
-                        }
-                        if (acc.follows.length >= 2000)
-                            cb(false)
-                        else {
-                            db.collection('accounts').findOne({name: tx.data.target}, function(err, account) {
-                                if (!account) {
-                                    cb(false)
-                                } else {
-                                    cb(true)
-                                }
-                            })
-                        }
-                    })
-                    break;
-
-                case TransactionType.UNFOLLOW:
-                    if (!tx.data.target || typeof tx.data.target !== "string" || tx.data.target.length > 25) {
-                        logr.debug('invalid tx data.target')
-                        cb(false); return
-                    }
-
-                    db.collection('accounts').findOne({name: tx.sender}, function(err, acc) {
-                        if (err) throw err;
-                        if (!acc.follows) acc.follows = []
-                        if (acc.follows.indexOf(tx.data.target) == -1) {
-                            cb(false); return
-                        }
-                        db.collection('accounts').findOne({name: tx.data.target}, function(err, account) {
-                            if (!account) {
-                                cb(false)
-                            } else {
-                                cb(true)
-                            }
-                        })
-                    })
-                    break;
-
-                default:
-                    cb(false)
-                    break;
+            // collect voting power when needed
+            let vt = null
+            let vtGrowConfig = {
+                growth: account.balance / config.vtGrowth,
+                max: account.maxVt
             }
+
+            switch (tx.type) {
+            case TransactionType.COMMENT:
+            case TransactionType.VOTE:
+            case TransactionType.PROMOTED_COMMENT:
+            case TransactionType.TIPPED_VOTE:
+                if (tx.type === TransactionType.TIPPED_VOTE && !config.hotfix1) break
+                vt = new GrowInt(account.vt, vtGrowConfig).grow(ts)
+                vt.v -= Math.abs(tx.data.vt)
+                break
+            case TransactionType.TRANSFER_VT:
+                vt = new GrowInt(account.vt, vtGrowConfig).grow(ts)
+                vt.v -= tx.data.amount
+                break
+            case TransactionType.LIMIT_VT:
+                vt = new GrowInt(account.vt, vtGrowConfig).grow(ts)
+                break
+            default:
+                break
+            }
+
+            // update vote lock for proposals
+            let newLock = 0
+            let activeProposalVotes = []
+            if (account.voteLock)
+                for (let v in account.proposalVotes)
+                    if (account.proposalVotes[v].end > ts) {
+                        if (account.proposalVotes[v].amount - account.proposalVotes[v].bonus > newLock)
+                            newLock = account.proposalVotes[v].amount - account.proposalVotes[v].bonus
+                        activeProposalVotes.push(account.proposalVotes[v])
+                    }
+
+            // update all at the same time !
+            let changes = {bw: bw}
+            if (vt) changes.vt = vt
+            if (account.voteLock) {
+                if (account.voteLock !== newLock)
+                    changes.voteLock = newLock
+                if (account.proposalVotes.length !== activeProposalVotes.length)
+                    changes.proposalVotes = activeProposalVotes
+            }
+            logr.trace('GrowInt Collect', account.name, changes)
+            cache.updateOne('accounts', 
+                {name: account.name},
+                {$set: changes},
+                function(err) {
+                    if (err) throw err
+                    cb(true)
+                })
         })
     },
     execute: (tx, ts, cb) => {
         transaction.collectGrowInts(tx, ts, function(success) {
             if (!success) throw 'Error collecting bandwidth'
-            switch (tx.type) {
-                case TransactionType.NEW_ACCOUNT:
-                    db.collection('accounts').insertOne({
-                        name: tx.data.name.toLowerCase(),
-                        pub: tx.data.pub,
-                        balance: 0,
-                        bw: {v:0,t:0},
-                        vt: {v:0,t:0},
-                        pr: {v:0,t:0},
-                        uv: 0
-                    }).then(function(){
-                        if (tx.data.name !== tx.data.pub || tx.data.name.length < 25) {
-                            db.collection('accounts').updateOne(
-                            {name: tx.sender},
-                            {$inc: {balance: -60}}, function() {
-                                db.collection('accounts').findOne({name: tx.sender}, function(err, acc) {
-                                    if (err) throw err;
-                                    // update his bandwidth
-                                    acc.balance += 60
-                                    transaction.updateGrowInts(acc, ts, function(success) {
-                                        if (!acc.approves) acc.approves = []
-                                        // and update his node_owners approvals values too
-                                        var node_appr_before = Math.floor(acc.balance/acc.approves.length)
-                                        acc.balance -= 60
-                                        var node_appr = Math.floor(acc.balance/acc.approves.length)
-                                        var node_owners = []
-                                        for (let i = 0; i < acc.approves.length; i++)
-                                            node_owners.push(acc.approves[i])
-                                        db.collection('accounts').updateMany(
-                                            {name: {$in: node_owners}},
-                                            {$inc: {node_appr: node_appr-node_appr_before}},
-                                        function(err) {
-                                            if (err) throw err;
-                                            cb(true, null, 60)
-                                        })
-                                    })
-                                })
-                            })
-                        } else cb(true)
-                    })
-                    break;
-    
-                case TransactionType.APPROVE_NODE_OWNER:
-                    db.collection('accounts').updateOne(
-                        {name: tx.sender},
-                        {$push: {approves: tx.data.target}},
-                    function() {
-                        db.collection('accounts').findOne({name: tx.sender}, function(err, acc) {
-                            if (err) throw err;
-                            if (!acc.approves) acc.approves = []
-                            var node_appr = Math.floor(acc.balance/acc.approves.length)
-                            var node_appr_before = (acc.approves.length == 1 ? 0 : Math.floor(acc.balance/(acc.approves.length-1)))
-                            var node_owners = []
-                            for (let i = 0; i < acc.approves.length; i++)
-                                if (acc.approves[i] != tx.data.target)
-                                    node_owners.push(acc.approves[i])
-    
-                            db.collection('accounts').updateMany(
-                                {name: {$in: node_owners}},
-                                {$inc: {node_appr: node_appr-node_appr_before}}, function() {
-                                db.collection('accounts').updateOne(
-                                    {name: tx.data.target},
-                                    {$inc: {node_appr: node_appr}}, function() {
-                                        cb(true)
-                                    }
-                                )
-                            })
-                        })
-                    })
-                    break;
-    
-                case TransactionType.DISAPROVE_NODE_OWNER:
-                    db.collection('accounts').updateOne(
-                        {name: tx.sender},
-                        {$pull: {approves: tx.data.target}},
-                    function() {
-                        db.collection('accounts').findOne({name: tx.sender}, function(err, acc) {
-                            if (err) throw err;
-                            if (!acc.approves) acc.approves = []
-                            var node_appr = (acc.approves.length == 0 ? 0 : Math.floor(acc.balance/acc.approves.length))
-                            var node_appr_before = Math.floor(acc.balance/(acc.approves.length+1))
-                            var node_owners = []
-                            for (let i = 0; i < acc.approves.length; i++)
-                                if (acc.approves[i] != tx.data.target)
-                                    node_owners.push(acc.approves[i])
-    
-                            db.collection('accounts').updateMany(
-                                {name: {$in: node_owners}},
-                                {$inc: {node_appr: node_appr-node_appr_before}}, function() {
-                                db.collection('accounts').updateOne(
-                                    {name: tx.data.target},
-                                    {$inc: {node_appr: -node_appr_before}}, function() {
-                                        cb(true)
-                                    }
-                                )
-                            })
-                        })
-                    })
-                    break;
-    
-                case TransactionType.TRANSFER:
-                    // remove funds from sender
-                    tx.data.amount = Math.floor(tx.data.amount)
-                    db.collection('accounts').updateOne(
-                        {name: tx.sender},
-                        {$inc: {balance: -tx.data.amount}},
-                    function() {
-                        db.collection('accounts').findOne({name: tx.sender}, function(err, acc) {
-                            if (err) throw err;
-                            // update his bandwidth
-                            acc.balance += tx.data.amount
-                            transaction.updateGrowInts(acc, ts, function(success) {
-                                if (!acc.approves) acc.approves = []
-                                // and update node_appr for miners he votes for
-                                var node_appr_before = Math.floor(acc.balance/acc.approves.length)
-                                acc.balance -= tx.data.amount
-                                var node_appr = Math.floor(acc.balance/acc.approves.length)
-                                
-                                var node_owners = []
-                                for (let i = 0; i < acc.approves.length; i++)
-                                    node_owners.push(acc.approves[i])
-                                
-                                db.collection('accounts').updateMany(
-                                    {name: {$in: node_owners}},
-                                    {$inc: {node_appr: node_appr-node_appr_before}}
-                                , function(err) {
-                                    if (err) throw err;
-                                    // add funds to receiver
-                                    db.collection('accounts').updateOne(
-                                        {name: tx.data.receiver},
-                                        {$inc: {balance: tx.data.amount}},
-                                    function() {
-                                        db.collection('accounts').findOne({name: tx.data.receiver}, function(err, acc) {
-                                            if (err) throw err;
-                                            // update his bandwidth
-                                            acc.balance -= tx.data.amount
-                                            transaction.updateGrowInts(acc, ts, function(success) {
-                                                if (!acc.approves) acc.approves = []
-                                                // and update his node_owners approvals values too
-                                                var node_appr_before = Math.floor(acc.balance/acc.approves.length)
-                                                acc.balance += tx.data.amount
-                                                var node_appr = Math.floor(acc.balance/acc.approves.length)
-                                                var node_owners = []
-                                                for (let i = 0; i < acc.approves.length; i++)
-                                                    node_owners.push(acc.approves[i])
-                                                db.collection('accounts').updateMany(
-                                                    {name: {$in: node_owners}},
-                                                    {$inc: {node_appr: node_appr-node_appr_before}},
-                                                function(err) {
-                                                    if (err) throw err;
-                                                    cb(true)
-                                                })
-                                            })
-                                        })
-                                    })
-                                })
-                            })
-                        })
-                    })
-                    break;
-
-                case TransactionType.COMMENT:
-                    db.collection('contents').replaceOne({
-                        author: tx.sender,
-                        link: tx.data.link
-                    },{
-                        author: tx.sender,
-                        link: tx.data.link,
-                        pa: tx.data.pa,
-                        pp: tx.data.pp,
-                        json: tx.data.json,
-                    }, {
-                        upsert: true
-                    }).then(function(){
-                        db.collection('contents').updateOne({
-                            author: tx.data.pa,
-                            link: tx.data.pp
-                        }, { $addToSet: {
-                            child: [tx.sender, tx.data.link]
-                        }})
-                        cb(true)
-                    })
-                    break;
-
-                case TransactionType.VOTE:
-                    var vote = {
-                        u: tx.sender,
-                        ts: ts,
-                        vt: tx.data.vt
-                    }
-                    db.collection('contents').updateOne({
-                        author: tx.data.author,
-                        link: tx.data.link
-                    },{$push: {
-                        votes: vote
-                    }}, {
-                        upsert: true
-                    }).then(function(){
-                        eco.distribute(tx.data.author, tx.data.vt, tx.ts, function(distributed) {
-                            cb(true, distributed)
-                        })
-                    })
-                    break;
-    
-                case TransactionType.USER_JSON:
-                    db.collection('accounts').updateOne({
-                        name: tx.sender
-                    },{ $set: {
-                        json: tx.data.json
-                    }}).then(function(){
-                        cb(true)
-                    })
-                    break;
-
-                case TransactionType.FOLLOW:
-                    db.collection('accounts').updateOne(
-                        {name: tx.sender},
-                        {$push: {follows: tx.data.target}},
-                    function() {
-                        db.collection('accounts').updateOne(
-                            {name: tx.data.target},
-                            {$push: {followers: tx.sender}},
-                        function() {
-                            cb(true)
-                        })
-                    })
-                    break;
-
-                case TransactionType.UNFOLLOW:
-                    db.collection('accounts').updateOne(
-                        {name: tx.sender},
-                        {$pull: {follows: tx.data.target}},
-                    function() {
-                        db.collection('accounts').updateOne(
-                            {name: tx.data.target},
-                            {$pull: {followers: tx.sender}},
-                        function() {
-                            cb(true)
-                        })
-                    })
-                    break;
-
-                default:
-                    cb(false)
-                    break;
-            }
-        })
-
-    },
-    collectGrowInts: (tx, ts, cb) => {
-        db.collection('accounts').findOne({name: tx.sender}, function(err, account) {
-            // collect bandwidth
-            var bandwidth = new GrowInt(account.bw, {growth:account.balance/(60000), max:1048576})
-            var needed_bytes = JSON.stringify(tx).length;
-            var bw = bandwidth.grow(ts)
-            bw.v -= needed_bytes
-
-            // collect voting tokens when needed
-            switch (tx.type) {
-                case TransactionType.COMMENT:
-                    var vt = new GrowInt(account.vt, {growth:account.balance/(3600000)}).grow(ts)
-                    vt.v -= 1
-                    break;
-
-                case TransactionType.VOTE:
-                    var vt = new GrowInt(account.vt, {growth:account.balance/(3600000)}).grow(ts)
-                    vt.v -= Math.abs(tx.data.vt)
-                    break;
-            
-                default:
-                    break;
-            }
-
-            // update both at the same time !
-            var changes = {bw: bw}
-            if (vt) changes.vt = vt
-            db.collection('accounts').updateOne(
-                {name: account.name},
-                {$set: changes},
-            function(err) {
-                if (err) throw err;
-                cb(true)
+            Transaction.execute(tx, ts, function(executed, distributed, burned) {
+                cb(executed, distributed, burned)
             })
         })
     },
+    updateIntsAndNodeApprPromise: (account, ts, change) => {
+        return new Promise((rs) => {
+            transaction.updateGrowInts(account,ts,() => transaction.adjustNodeAppr(account,change,() => rs(true)))
+        })
+    },
     updateGrowInts: (account, ts, cb) => {
-        // updates the bandwidth and vote tokens when the growth changes (transfer)
-        var bw = new GrowInt(account.bw, {growth:account.balance/(60000), max:1048576}).grow(ts)
-        var vt = new GrowInt(account.vt, {growth:account.balance/(3600000)}).grow(ts)
-        db.collection('accounts').updateOne(
+        // updates the bandwidth and vote tokens when the balance changes (transfer, monetary distribution)
+        // account.balance is the one before the change (!)
+        if (!account.bw || !account.vt) 
+            logr.debug('error loading grow int', account)
+        
+        let bw = new GrowInt(account.bw, {
+            growth: Math.max(account.baseBwGrowth || 0, account.balance)/(config.bwGrowth),
+            max: config.bwMax
+        }).grow(ts)
+        let vt = new GrowInt(account.vt, {growth:account.balance/(config.vtGrowth)}).grow(ts)
+        if (!bw || !vt) {
+            logr.fatal('error growing grow int', account, ts)
+            return
+        }
+        logr.trace('GrowInt Update', account.name, bw, vt)
+        cache.updateOne('accounts', 
             {name: account.name},
             {$set: {
                 bw: bw,
                 vt: vt
             }},
-        function(err) {
-            if (err) throw err;
+            function(err) {
+                if (err) throw err
+                cb(true)
+            })
+    },
+    adjustNodeAppr: (acc, newCoins, cb) => {
+        // updates the node_appr values for the node owners the account approves (when balance changes)
+        // account.balance is the one before the change (!)
+        // account object may skip cloneDeep operation
+        if (!acc.approves || acc.approves.length === 0 || !newCoins) {
             cb(true)
-        })
+            return
+        }
+
+        let node_appr_before = Math.floor(acc.balance/acc.approves.length)
+        let node_appr = Math.floor((acc.balance+newCoins)/acc.approves.length)
+        
+        let node_owners = []
+        for (let i = 0; i < acc.approves.length; i++)
+            node_owners.push(acc.approves[i])
+        
+        logr.trace('NodeAppr Update', acc.name, newCoins, node_appr-node_appr_before, node_owners.length)
+        cache.updateMany('accounts', 
+            {name: {$in: node_owners}},
+            {$inc: {node_appr: node_appr-node_appr_before}}
+            , function(err) {
+                if (err) throw err
+                cb(true)
+            })
     }
 }
 

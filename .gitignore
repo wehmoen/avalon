@@ -5,3 +5,8 @@ npm-debug.log
 keys
 logs/*
 tmptx.json
+bin
+dump
+genesis
+apidoc
+.DS_Store

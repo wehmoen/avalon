@@ -15,14 +15,14 @@ module.exports = class DecayInt {
 
     decay(time) {
         if (time < this.t) return
-        if (this.v == 0) return {v:0,t:time}
+        if (this.v === 0) return {v:0,t:time}
 
-        var tmpValue = this.v
-        var timeDiff = time-this.t
+        let tmpValue = this.v
+        let timeDiff = time-this.t
         tmpValue = tmpValue*Math.exp(-this.config.lifetime*timeDiff)
         
-        var newValue = Math.ceil(tmpValue)
-        var newTime = Math.ceil(this.t-Math.log(newValue/this.v)/this.config.lifetime)
+        let newValue = Math.ceil(tmpValue)
+        let newTime = Math.ceil(this.t-Math.log(newValue/this.v)/this.config.lifetime)
 
         if (newValue > this.config.max)
             newValue = this.config.max
